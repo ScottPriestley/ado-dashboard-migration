@@ -81,8 +81,8 @@ $queries | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $OutDir 'quer
     sourceOrg         = $Org
     sourceProjectName = $Project
     sourceProjectId   = $proj.id
-    targetOrg         = "<FILL: e.g. HSOUSCloud>"
-    targetProjectName = "<FILL: e.g. Internal Hub>"
+    targetOrg         = "<FILL>"
+    targetProjectName = "<FILL>"
     targetProjectId   = "<AUTO: filled by step 3>"
     teamMap           = @( $teams | ForEach-Object {
                             @{ sourceTeamName = $_.name; sourceTeamId = $_.id
