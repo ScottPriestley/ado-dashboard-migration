@@ -13,13 +13,14 @@ param(
     [Parameter(Mandatory)][string]$TargetOrg,
     [Parameter(Mandatory)][string]$TargetProject,
     [string]$ExportDir = "./export",
-    [string]$QueryFolderName = "Migrated Dashboards",
+    [string]$QueryFolderName = "",    # optional wrapper folder under Shared Queries; empty = preserve the source folder structure as-is (e.g. Shared Queries/Dashboard Queries/...)
     [string]$SourceProjectName = ""   # if set, occurrences in WIQL are rewritten to TargetProject
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_common.ps1')
 
-$headers = Get-AdoAuthHeader -EnvVarName 'ADO_TARGET_PAT'
+$TargetOrg = Get-OrgName $TargetOrg   # accept bare name or full URL
+$headers = Get-AdoAuthHeader -EnvVarName 'ADO_TARGET_PAT' -Purpose "TARGET org '$TargetOrg'"
 $base    = "https://dev.azure.com/$(UrlEnc $TargetOrg)"
 $projSeg = UrlEnc $TargetProject
 $queries = Get-Content (Join-Path $ExportDir 'queries.json') -Raw | ConvertFrom-Json
@@ -43,13 +44,30 @@ function Ensure-QueryFolder {
     return "$ParentPath/$Name"
 }
 
-$rootPath = Ensure-QueryFolder -ParentPath 'Shared Queries' -Name $QueryFolderName
-$queryMap = @{}
-$warnings = @()
+# Root: preserve the source structure directly under Shared Queries (default),
+# or nest it under an optional wrapper folder if -QueryFolderName was supplied.
+$rootPath = if ($QueryFolderName) { Ensure-QueryFolder -ParentPath 'Shared Queries' -Name $QueryFolderName } else { 'Shared Queries' }
+$queryMap      = @{}
+$warnings      = @()
+$skippedProc   = @()   # genuinely can't be created here: missing field/type/state
+$failedOther   = @()   # failed for another reason (e.g. transient) — rerun may fix
+$createdCount  = 0
+$reusedCount   = 0
+$rewroteCount  = 0
+$areaFilterCnt = 0
+
+# Pull the concise ADO "message" out of an error (Invoke-Ado folds the JSON body in).
+function Get-AdoMsg {
+    param($ErrorRecord)
+    $m = "$($ErrorRecord.Exception.Message)"
+    if ($m -match '"message"\s*:\s*"([^"]+)"') { return $Matches[1] }
+    return $m
+}
 
 foreach ($q in $queries) {
-    # Preserve the source folder structure under the migration folder.
-    # Source path looks like "Shared Queries/Folder A/My Query" or "My Queries/..."
+    # Preserve the source folder structure (minus the "Shared Queries"/"My Queries" root
+    # and the query's own name). Source path looks like
+    # "Shared Queries/Dashboard Queries/RAID/Open Risk" -> relDir "Dashboard Queries/RAID".
     $relDir = ($q.path -replace '^(Shared Queries|My Queries)/', '') -replace "/$([regex]::Escape($q.name))$", ''
     if ($relDir -eq $q.name -or [string]::IsNullOrWhiteSpace($relDir)) { $relDir = '' }
     $parent = $rootPath
@@ -61,34 +79,61 @@ foreach ($q in $queries) {
     $wiql = $q.wiql
     if ($SourceProjectName -and $wiql -match [regex]::Escape($SourceProjectName)) {
         $wiql = $wiql -replace [regex]::Escape($SourceProjectName), $TargetProject
-        $warnings += "REWROTE project name in WIQL of '$($q.name)' — verify area/iteration paths exist in target."
+        $rewroteCount++
     }
-    if ($wiql -match '\[System\.(AreaPath|IterationPath)\]\s*(=|under|in)') {
-        $warnings += "'$($q.name)' filters on Area/Iteration path — if the path doesn't exist in '$TargetProject', it returns 0 results."
-    }
+    if ($wiql -match '\[System\.(AreaPath|IterationPath)\]\s*(=|under|in)') { $areaFilterCnt++ }
+
+    function Set-Map { param($TargetId) $queryMap[$q.id] = $TargetId; foreach ($a in @($q.aliasIds)) { if ($a) { $queryMap[$a] = $TargetId } } }
 
     try {
         $created = Invoke-Ado -Headers $headers -Method POST `
             -Uri "$base/$projSeg/_apis/wit/queries/$(UrlEnc $parent)?api-version=7.1" `
             -Body @{ name = $q.name; wiql = $wiql }
-        $queryMap[$q.id] = $created.id
-        Write-Host "  created: $parent/$($q.name)"
+        Set-Map $created.id; $createdCount++
+        Write-Host "  created: $parent/$($q.name)$(if (@($q.aliasIds).Count) { " (+$(@($q.aliasIds).Count) drifted alias)" })"
     } catch {
-        # Already exists (rerun) -> fetch existing id. Otherwise surface the error (bad WIQL etc.)
-        try {
-            $existing = Invoke-Ado -Headers $headers `
-                -Uri "$base/$projSeg/_apis/wit/queries/$(UrlEnc "$parent/$($q.name)")?api-version=7.1"
-            $queryMap[$q.id] = $existing.id
-            Write-Host "  exists:  $parent/$($q.name) (reusing)"
-        } catch {
-            $warnings += "FAILED to create '$($q.name)': $($_.Exception.Message) — likely WIQL references a field/type/state missing in the target process. Fix manually, then add its id to querymap.json."
+        $postMsg = Get-AdoMsg $_
+        if ($postMsg -match '409|already exists|TF237018|VS402371') {
+            # Query already there (rerun) -> reuse its id.
+            try {
+                $existing = Invoke-Ado -Headers $headers `
+                    -Uri "$base/$projSeg/_apis/wit/queries/$(UrlEnc "$parent/$($q.name)")?api-version=7.1"
+                Set-Map $existing.id; $reusedCount++
+                Write-Host "  exists:  $parent/$($q.name) (reusing)"
+            } catch {
+                $failedOther += "$($q.name): exists but couldn't read id — $(Get-AdoMsg $_)"
+            }
+        }
+        elseif ($postMsg -match 'TF51005|does not exist|is not (a )?valid|unknown field|not recognized|VS403|field') {
+            # WIQL references a field/type/state the target process doesn't have.
+            $skippedProc += "$($q.name) — $postMsg"
+            Write-Host "  skip:    $parent/$($q.name) (process mismatch)" -ForegroundColor DarkYellow
+        }
+        else {
+            # Something else (often transient after retries) — a rerun may succeed.
+            $failedOther += "$($q.name) — $postMsg"
+            Write-Host "  FAILED:  $parent/$($q.name) — $postMsg" -ForegroundColor Red
         }
     }
 }
 
 $queryMap | ConvertTo-Json | Set-Content -Path (Join-Path $ExportDir 'querymap.json') -Encoding utf8
-Write-Host "`nMapped $($queryMap.Count) of $(@($queries).Count) queries -> $(Join-Path $ExportDir 'querymap.json')" -ForegroundColor Green
-if ($warnings) {
-    Write-Host "`nWarnings:" -ForegroundColor Yellow
-    $warnings | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+
+Write-Host "`n=== Summary ===" -ForegroundColor Cyan
+Write-Host ("  created:        {0}" -f $createdCount) -ForegroundColor Green
+Write-Host ("  reused:         {0}" -f $reusedCount)
+Write-Host ("  skipped (process mismatch): {0}" -f $skippedProc.Count) -ForegroundColor DarkYellow
+Write-Host ("  failed (other / transient): {0}" -f $failedOther.Count) -ForegroundColor $(if ($failedOther.Count) { 'Red' } else { 'Gray' })
+Write-Host ("  querymap entries written:   {0} -> {1}" -f $queryMap.Count, (Join-Path $ExportDir 'querymap.json'))
+if ($rewroteCount)  { Write-Host "  ($rewroteCount queries had the source project name rewritten in WIQL — verify area/iteration paths exist in target.)" }
+if ($areaFilterCnt) { Write-Host "  ($areaFilterCnt queries filter on Area/Iteration path — they return 0 results if that path doesn't exist in '$TargetProject'.)" }
+
+if ($skippedProc) {
+    Write-Host "`nSkipped — target process is missing a field/type/state (can't recreate as-is):" -ForegroundColor DarkYellow
+    $skippedProc | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" -ForegroundColor DarkYellow }
 }
+if ($failedOther) {
+    Write-Host "`nFailed for another reason — RERUN this script; these are often transient and idempotent:" -ForegroundColor Red
+    $failedOther | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+}
+$skippedProc | Sort-Object -Unique | Set-Content -Path (Join-Path $ExportDir 'queries-skipped.txt') -Encoding utf8
