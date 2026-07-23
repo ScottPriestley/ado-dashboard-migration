@@ -21,7 +21,8 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_common.ps1')
 
-$headers  = Get-AdoAuthHeader -EnvVarName 'ADO_TARGET_PAT'
+$TargetOrg = Get-OrgName $TargetOrg   # accept bare name or full URL
+$headers  = Get-AdoAuthHeader -EnvVarName 'ADO_TARGET_PAT' -Purpose "TARGET org '$TargetOrg'"
 $base     = "https://dev.azure.com/$(UrlEnc $TargetOrg)"
 $projSeg  = UrlEnc $TargetProject
 $mapping  = Get-Content (Join-Path $ExportDir 'mapping.json') -Raw | ConvertFrom-Json
@@ -88,7 +89,12 @@ Get-ChildItem (Join-Path $ExportDir 'dashboards') -Filter *.json | ForEach-Objec
         # Flag any GUID that survived substitution and isn't a known target id
         $leftover = (Get-GuidsInText -Text $newSettings) | Where-Object { $knownTargetGuids -notcontains $_ }
         if ($leftover) {
-            $flags += "[$teamName] $name / '$($w.name)' ($($w.contributionId)): unmapped refs $($leftover -join ', ') — widget will likely need manual reconfiguration."
+            if ($w.contributionId -like '*TcmChartWidget*') {
+                # Test Plan/Suite chart — its ids are planId/suiteId/transformId, not queries.
+                $flags += "[$teamName] $name / '$($w.name)': Test Plan chart — migrate the Test Plan/Suite separately, then point this chart at it. (refs $($leftover -join ', '))"
+            } else {
+                $flags += "[$teamName] $name / '$($w.name)' ($($w.contributionId)): unmapped refs $($leftover -join ', ') — widget will likely need manual reconfiguration."
+            }
         }
         if ($w.contributionId -and $w.contributionId -notlike 'ms.*') {
             $flags += "[$teamName] $name / '$($w.name)': extension widget '$($w.contributionId)' — ensure the extension is installed in $TargetOrg."
