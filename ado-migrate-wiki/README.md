@@ -1,168 +1,256 @@
-# Azure DevOps Wiki Migration
+# Azure DevOps Wiki Tools
 
-`ado-migrate-wiki.ps1` copies the Markdown pages from one Azure DevOps wiki into a wiki in another Azure DevOps project. The source and target can be in the same organization or in different organizations.
+Three standalone PowerShell scripts for copying Azure DevOps wiki page content directly between projects or moving it through local Markdown files.
 
-The script uses the Azure DevOps REST API. It can add pages to an existing target wiki or create a project wiki when the requested target wiki does not exist.
+| Script | Purpose | Best used when |
+| --- | --- | --- |
+| `ado-migrate-wiki.ps1` | Copies one wiki directly from a source project to a target project | Both Azure DevOps environments are available during the migration |
+| `ado-extract-wiki.ps1` | Exports one or all visible source wikis to local Markdown files | You need a backup, reviewable files, or an offline handoff |
+| `ado-load-wiki.ps1` | Loads one manifest-backed Markdown export into a target project wiki | Content was previously created by `ado-extract-wiki.ps1` |
 
-## Migration behavior
+Each script is self-contained. The direct migration script does not call the Extract or Load scripts, and the Extract and Load scripts can be used independently on different machines.
 
-The script:
+## Features
 
-- Connects to the source and target Azure DevOps organizations using personal access tokens (PATs).
-- Finds a source wiki and recursively exports its complete page tree and Markdown content.
-- Finds or creates the target project wiki.
-- Creates parent pages before their child pages.
-- Creates pages that do not exist in the target wiki.
-- Updates pages that already exist at the same path, using the current ETag to prevent an unsafe concurrent update.
-- Reads the migrated pages back from Azure DevOps and compares their paths and content with the source.
-- Fails the run if a page cannot be imported or the target content does not match the source.
-- Generates a detailed log, export report, and migration summary.
+- Discovers nested Azure DevOps wiki page trees recursively.
+- Retrieves every page body through a separate content request.
+- Excludes the synthetic, non-writable `/` wiki root.
+- Preserves wiki page paths and parent-child hierarchy.
+- Creates parent pages before child pages.
+- Creates missing target pages and updates matching target paths.
+- Uses the current target ETag when updating an existing page.
+- Reads target pages back after writing and fails on content differences.
+- Supports project names, wiki names, and page paths containing spaces.
+- Requires no Azure CLI extensions or third-party PowerShell modules.
+
+The Extract and Load workflow adds:
+
+- UTF-8 Markdown files without a byte order mark.
+- Windows-safe local filenames.
+- A JSON manifest that preserves the original wiki paths and metadata.
+- SHA-256 validation before loading any exported Markdown file.
+- Protection against duplicate paths, path traversal, missing files, and manifest count mismatches.
 
 > [!WARNING]
-> The source content replaces content at matching target paths, including the root page `/`. Pages in the target wiki whose paths do not occur in the source are retained. Test the migration in a nonproduction project or back up important target content before running it.
+> Existing target pages at matching paths are replaced with source content. Target-only pages are retained; none of these scripts delete pages. Back up important target content or test against a nonproduction project first.
 
 ## Prerequisites
 
 - Windows PowerShell 5.1 or PowerShell 7 or later.
-- Network access to `https://dev.azure.com`.
-- At least Basic access in both Azure DevOps organizations.
-- Permission to read the source project and wiki.
-- Permission to read and update the target project and wiki.
-- Permission to create the target project wiki if one does not already exist.
+- Network access to `https://dev.azure.com` for operations that contact Azure DevOps.
+- Read access to each source project and wiki.
+- Read and write access to each target project and wiki.
+- Permission to create a project wiki when the target project does not already have one.
 
-No PowerShell modules or Azure CLI extensions are required.
+The scripts prompt for personal access tokens (PATs) as secure console input. PAT values are converted to Basic authorization headers in memory and are not written to output files or logs.
 
-## Personal access tokens
+Use PATs with the minimum access needed:
 
-The script prompts separately for a source PAT and a target PAT. The tokens can be the same when both projects are in the same organization and the token has access to both projects.
+| Operation | PAT access |
+| --- | --- |
+| Extract | Read the source project and wiki |
+| Load | Read the target project; read and write the target wiki |
+| Direct migration | Source read access plus target read and write access |
 
-Recommended PAT scopes:
+The source and target PAT can be the same for a direct migration when one identity has suitable access to both projects.
 
-| Token      | Required access                              |
-| ---------- | -------------------------------------------- |
-| Source PAT | Project and Team: Read; Wiki: Read           |
-| Target PAT | Project and Team: Read; Wiki: Read and Write |
+## Quick Start
 
-The identity associated with the target PAT must also have suitable project and wiki permissions. Creating a project wiki can require elevated repository or project administration permissions, depending on the target project's security configuration.
+Run scripts from PowerShell in the repository directory. Omitted connection parameters are requested interactively, and PATs are always prompted securely.
 
-PAT values are entered as secure console input. They are converted to an authorization header in memory and are not written to the generated reports or log.
-
-## Usage
-
-Open PowerShell in the directory containing the script and run:
+### Direct migration
 
 ```powershell
-.\Migrate-AzureDevOpsWiki.ps1
+.\ado-migrate-wiki.ps1
 ```
 
-The script prompts for:
-
-1. Source organization name
-2. Source project name
-3. Source PAT
-4. Target organization name
-5. Target project name
-6. Target PAT
-
-Enter organization names only, such as `contoso`, rather than the full `https://dev.azure.com/contoso` URL.
-
-### Select a source wiki
-
-Most projects have one project wiki. If the source project exposes more than one wiki, the script stops rather than merging them and potentially overwriting pages with identical paths.
-
-Select a wiki by name or ID:
+### Extract to Markdown
 
 ```powershell
-.\Migrate-AzureDevOpsWiki.ps1 -SourceWikiName "SourceProject.wiki"
+.\ado-extract-wiki.ps1 `
+    -Organization "source-org" `
+    -Project "Source Project" `
+    -WikiName "Source Project.wiki" `
+    -OutputPath ".\wiki-export"
 ```
 
-### Select the target wiki
+### Load the extracted Markdown
 
-By default, the script targets the project wiki named after the target project. Use `-TargetWikiName` to select another wiki:
+Pass the folder containing `wiki-export-manifest.json`:
+
+```powershell
+.\ado-load-wiki.ps1 `
+    -SourcePath ".\wiki-export\Source Project.wiki" `
+    -Organization "target-org" `
+    -Project "Target Project"
+```
+
+## Direct Migration
+
+`ado-migrate-wiki.ps1` reads one source wiki and writes it directly to a target project wiki. It supports projects in the same organization or different organizations.
 
 ```powershell
 .\ado-migrate-wiki.ps1 `
-    -SourceWikiName "SourceProject.wiki" `
-    -TargetWikiName "TargetProject.wiki"
+    -SourceOrganization "source-org" `
+    -SourceProject "Source Project" `
+    -SourceWikiName "Source Project.wiki" `
+    -TargetOrganization "target-org" `
+    -TargetProject "Target Project" `
+    -TargetWikiName "Target Project.wiki"
 ```
 
-The script adds content to the selected wiki. It does not delete target-only pages.
+The script prompts for any omitted organization or project value and separately prompts for the source and target PATs. If the source project exposes multiple wikis, specify `-SourceWikiName`; the script stops rather than merging them implicitly.
 
-## Parameters
+When `-TargetWikiName` is omitted, the first existing project wiki is used. If no project wiki exists, one is created using the target project name. When `-TargetWikiName` is supplied but no matching wiki exists, a project wiki is created with that name.
 
-| Parameter        | Type   | Description                                                                                              |
-| ---------------- | ------ | -------------------------------------------------------------------------------------------------------- |
-| `SourceWikiName` | String | Optional source wiki name or ID. Required when the source project has multiple wikis.                    |
-| `TargetWikiName` | String | Optional target wiki name. Defaults to the target project name and therefore its standard project wiki.  |
-| `NoExecute`      | Switch | Loads the functions without starting an interactive migration. Intended for testing and troubleshooting. |
+### Migration parameters
 
-## Output files
+| Parameter | Description |
+| --- | --- |
+| `SourceOrganization` | Source Azure DevOps organization name. Prompts when omitted. |
+| `SourceProject` | Source project name or ID. Prompts when omitted. |
+| `SourceWikiName` | Optional source wiki name or ID. Required when more than one source wiki is visible. |
+| `TargetOrganization` | Target Azure DevOps organization name. Prompts when omitted. |
+| `TargetProject` | Target project name or ID. Prompts when omitted. |
+| `TargetWikiName` | Optional target wiki name or ID. Selects an existing match or names a new project wiki. |
+| `NoExecute` | Loads the script functions without starting the interactive migration. Intended for testing. |
 
-Each run creates timestamped files in the current working directory:
+### Migration output
 
-| File                                       | Purpose                                                 |
-| ------------------------------------------ | ------------------------------------------------------- |
-| `WikiMigration_yyyyMMdd_HHmmss.log`        | Detailed execution log and errors                       |
-| `WikiMigration_yyyyMMdd_HHmmss.md`         | Exported page inventory and Markdown content            |
-| `WikiMigration_Summary_yyyyMMdd_HHmmss.md` | Target details, import counts, status, and output paths |
+Every run creates a timestamped log in the current working directory:
 
-A successful exit means that every exported source page was written and its target content passed read-back validation. Review the summary and log before treating the migration as complete.
+```text
+WikiMigration_yyyyMMdd_HHmmss.log
+```
 
-## Conflict and failure handling
+The log records page retrieval, create or update operations, validation, counts, and errors. A successful run ends only after every target page returns content identical to its source page.
 
-- An existing page at the same path is updated with source content.
-- The update uses the target page's current ETag. Azure DevOps rejects the update if another process changes the page between the read and write operations.
-- A missing page is created.
-- A failed page causes the overall migration to fail.
-- A missing or ambiguous source wiki causes the migration to fail before import.
-- A target read-back mismatch causes the migration to fail.
-- The script exits with code `1` after an unhandled migration error.
+## Extract to Markdown
 
-The script is safe to rerun after correcting a failure. Existing migrated paths are updated and missing paths are created.
+`ado-extract-wiki.ps1` exports all visible wikis by default. Use `-WikiName` to export a single wiki by name or ID.
 
-## Current limitations
+```powershell
+.\ado-extract-wiki.ps1 -Organization "source-org" -Project "Source Project"
+```
 
-This is a page-content migration, not a Git repository history migration. It does not preserve or migrate:
+If `-OutputPath` is omitted, the script creates a timestamped folder in the current working directory:
 
-- Wiki Git commit history, authors, or timestamps
-- Page revision history
-- Page display order metadata such as `.order` files
-- Wiki attachments or other binary files
-- Wiki permissions and security settings
-- Comments or other project configuration
-- Deleted pages
+```text
+WikiExport_<project>_yyyyMMdd_HHmmss
+```
 
-Markdown links are copied as written. Links that contain source organization, project, wiki, or attachment URLs may still point to the source and should be reviewed after migration.
+Each wiki receives its own subfolder. Page hierarchy is represented by folders, while the page itself is represented by a Markdown file:
 
-Only one source wiki is migrated per run. Run the script separately for additional source wikis and choose target paths or wikis carefully to avoid collisions.
+```text
+WikiExport_Source Project_20260723_120000/
+|-- Source Project.wiki/
+|   |-- Home.md
+|   |-- Delivery.md
+|   |-- Delivery/
+|   |   `-- Release-Checklist.md
+|   `-- wiki-export-manifest.json
+```
 
-For migrations that must preserve Git history, `.order` files, or attachments, use a Git-based wiki repository migration instead of this REST page migration.
+The manifest records the source organization, project, wiki identity and type, page count, original wiki path, relative Markdown filename, content length, SHA-256 hash, order value, and Git item path.
+
+Characters that Windows does not permit in filenames are replaced with `_`. Reserved Windows names such as `CON` and `NUL` are prefixed with `_`. The manifest remains the source of truth for mapping those local names back to their original Azure DevOps paths.
+
+The extractor stops instead of overwriting data when two pages map to the same case-insensitive local path or when two wiki names map to the same local folder.
+
+### Extract parameters
+
+| Parameter | Description |
+| --- | --- |
+| `Organization` | Source Azure DevOps organization name. Prompts when omitted. |
+| `Project` | Source project name or ID. Prompts when omitted. |
+| `WikiName` | Optional wiki name or ID. All visible wikis are exported when omitted. |
+| `OutputPath` | Optional output root. Defaults to a timestamped folder in the current directory. |
+| `NoExecute` | Loads the script functions without starting extraction. Intended for testing. |
+
+## Load from Markdown
+
+`ado-load-wiki.ps1` accepts one wiki export produced by `ado-extract-wiki.ps1`. Before connecting to Azure DevOps, it validates the manifest, every referenced file, every SHA-256 hash, the declared page count, and all resolved file paths.
+
+`-SourcePath` can point directly to the wiki folder containing `wiki-export-manifest.json`, or to a parent folder containing exactly one manifest. If more than one manifest is found, select one wiki folder explicitly.
+
+Paths pasted with surrounding single or double quotes are accepted:
+
+```powershell
+.\ado-load-wiki.ps1 -SourcePath '"C:\Exports\Source Project.wiki"'
+```
+
+The loader uses the target project's existing project wiki when available. If no suitable project wiki exists, it creates one named after the target project. Pages are uploaded parent-first, existing pages are updated with ETags, and all content is read back and compared by SHA-256.
+
+### Load parameters
+
+| Parameter | Description |
+| --- | --- |
+| `SourcePath` | Extracted wiki folder or a parent containing exactly one manifest. Prompts when omitted. |
+| `Organization` | Target Azure DevOps organization name. Prompts when omitted. |
+| `Project` | Target project name or ID. Prompts when omitted. |
+| `NoExecute` | Loads the script functions without starting the load. Intended for testing. |
+
+## Update and Recovery Behavior
+
+- A missing target page is created.
+- An existing target page at the same path is updated with source content.
+- Existing updates include the target page's current ETag in `If-Match`.
+- Azure DevOps rejects the update if another process changes the page between the read and write requests.
+- Parent pages are processed before nested child pages.
+- Target pages that do not occur in the source are left unchanged.
+- A failed API request, source validation error, or target content mismatch fails the run.
+- Runs are safe to repeat after correcting the cause of a failure: existing paths are updated and missing paths are created.
+
+For the Extract and Load workflow, do not edit a Markdown file without also deliberately updating its manifest hash. A hash mismatch is treated as possible corruption and stops the load before any target changes are made. To migrate intentionally edited files, regenerate the export or update the manifest through a controlled process.
 
 ## Troubleshooting
 
 ### `401 Unauthorized`
 
-Verify that the PAT belongs to the organization being accessed, has not expired, and includes the required scopes.
+Confirm that the PAT belongs to the organization being accessed, has not expired, and has the required access.
 
 ### `403 Forbidden`
 
-Verify the PAT scopes, the user's Azure DevOps access level, project membership, and wiki or repository permissions. Creating a missing project wiki can require more permission than updating an existing wiki.
+Confirm the user's Azure DevOps access level, project membership, PAT access, and wiki or repository permissions. Creating a missing project wiki can require more permission than editing an existing one.
 
 ### Multiple source wikis were found
 
-Rerun the script with `-SourceWikiName` and supply the exact wiki name or ID shown in the error.
+Use `-SourceWikiName` with `ado-migrate-wiki.ps1`, or `-WikiName` with `ado-extract-wiki.ps1`.
 
-### Page update failed
+### Multiple wiki exports were found
 
-A target page might have changed during migration, or the target identity might not have edit permission. Review the timestamped log for the page path and Azure DevOps response.
+Point `ado-load-wiki.ps1 -SourcePath` to one wiki subfolder containing a single `wiki-export-manifest.json`.
 
-### Validation failed
+### SHA-256 validation failed
 
-The script successfully sent one or more writes but did not read back identical content. Review the failed paths in the log, correct the underlying permission or API problem, and rerun the migration.
+The Markdown file no longer matches the export manifest. Restore the original file or regenerate the export. This check runs before Azure DevOps target writes begin.
 
-## Security notes
+### ETag or page update failed
 
-- Use PATs with the minimum required scopes and short expiration periods.
-- Do not place PATs directly in the script or command history.
-- Revoke temporary migration PATs after the migration is accepted.
-- Treat the detailed export report as potentially sensitive because it contains the full wiki page content.
+The page may have changed during the migration, or the target identity may not have edit permission. Confirm the target page state and rerun after resolving the conflict.
+
+### Target validation failed
+
+The write completed but Azure DevOps did not return identical page content. Review the reported path, correct the permission or API issue, and rerun the operation.
+
+## Limitations
+
+These tools migrate current Markdown page content and hierarchy through the Azure DevOps REST API. They do not preserve or migrate:
+
+- Wiki Git commit history, authors, timestamps, or page revisions.
+- `.order` files or exact navigation ordering.
+- Attachments or other binary files.
+- Wiki permissions and security settings.
+- Comments, deleted pages, or other project configuration.
+
+Markdown links are copied as written. Absolute links to source organizations, projects, wikis, or attachments can continue to point to the source and should be reviewed after migration.
+
+For migrations that must preserve Git history, `.order` files, or attachments, use a Git-based Azure DevOps wiki repository migration instead.
+
+## Security
+
+- Use short-lived PATs with the minimum required access.
+- Do not place PATs in scripts, command-line parameters, source control, or shell history.
+- Revoke temporary migration PATs after validating the result.
+- Treat exported Markdown and manifests as potentially sensitive project data.
+- Store exports in an access-controlled location and remove them when they are no longer required.
